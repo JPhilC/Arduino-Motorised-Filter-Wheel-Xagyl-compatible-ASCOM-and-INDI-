@@ -5,14 +5,14 @@
 // CONFIGURATION
 // =========================================================
 
-#define DEBUG 1   // Set to 1 for verbose debug output
+#define DEBUG 1  // Set to 1 for verbose debug output
 
 // Pins
 #define SENSOR A3
 #define hallPower A2
 #define hallCom A1
-#define upButton 5
-#define downButton 4
+#define upButton 4
+#define downButton 5
 #define buzzerPin 2
 #define ledPin 3
 
@@ -31,21 +31,22 @@
 // Filter wheel settings
 #define numberOfFilters 5
 #define offSetResolution 5
-#define homingOffsetSteps -73
+#define homingOffsetSteps 83
+#define backlashOvershoot 100
 
 // Optional peripherals
 #define buzzerConnected 0
 #define ledConnected 0
 
 // Motor type (fixed)
-#define motorType 1   // 1 = unipolar 28BYJ-48
+#define motorType 1  // 1 = unipolar 28BYJ-48
 
 // =========================================================
 // GLOBALS
 // =========================================================
 
 #if motorType == 1
-AccelStepper stepper(4, IN1, IN3, IN2, IN4);
+AccelStepper stepper(4, IN2, IN4, IN1, IN3);
 #endif
 
 int filterPos[numberOfFilters + 1];
@@ -98,9 +99,12 @@ bool loadSensorSettings() {
 
   if (DEBUG) {
     Serial.println("Loaded sensor settings from EEPROM:");
-    Serial.print("Threshold="); Serial.println(analogSensorThreshold);
-    Serial.print("Digital="); Serial.println(sensorIsDigital);
-    Serial.print("ActiveHigh="); Serial.println(activeHigh);
+    Serial.print("Threshold=");
+    Serial.println(analogSensorThreshold);
+    Serial.print("Digital=");
+    Serial.println(sensorIsDigital);
+    Serial.print("ActiveHigh=");
+    Serial.println(activeHigh);
   }
 
   return true;
@@ -135,8 +139,10 @@ void detectSensorType() {
     if (v > maxVal) maxVal = v;
   }
 
-  Serial.print("min="); Serial.print(minVal);
-  Serial.print(" max="); Serial.println(maxVal);
+  Serial.print("min=");
+  Serial.print(minVal);
+  Serial.print(" max=");
+  Serial.println(maxVal);
 
   // Digital detection
   if (minVal < 50 || maxVal > 970) {
@@ -151,8 +157,10 @@ void detectSensorType() {
     analogSensorThreshold = activeHigh ? (maxVal - 40) : (minVal + 40);
 
     Serial.println("Sensor is ANALOG");
-    Serial.print("Analog threshold = "); Serial.println(analogSensorThreshold);
-    Serial.print("Polarity: active "); Serial.println(activeHigh ? "HIGH" : "LOW");
+    Serial.print("Analog threshold = ");
+    Serial.println(analogSensorThreshold);
+    Serial.print("Polarity: active ");
+    Serial.println(activeHigh ? "HIGH" : "LOW");
   }
 
   // Rewind
@@ -179,106 +187,67 @@ void motor_Off() {
 // =========================================================
 
 bool homeWheel() {
-    long safetyLimit = stepsPerRevolution * 2;
-    long target = stepper.currentPosition() + safetyLimit;
-  
+
+  long safetyLimit = stepsPerRevolution * 2;
+  long target;
+
   if (DEBUG) {
     Serial.println("=== HOMING START ===");
-    Serial.print("safetyLimit = ");
-    Serial.println(safetyLimit);
-    Serial.print("target = ");
-    Serial.println(target);
   }
 
-    stepper.setAcceleration(setAccel);
-    stepper.setMaxSpeed(maxSpeed);
-    stepper.moveTo(target);
+  stepper.setAcceleration(setAccel);
+  stepper.setMaxSpeed(maxSpeed);
 
-    while (stepper.distanceToGo() != 0) {
-        stepper.run();   // <-- identical timing to detectSensorType()
+  // ----------------------------------------------------
+  // PHASE 1: Move until we are OFF the magnet
+  // ----------------------------------------------------
+  target = stepper.currentPosition() - safetyLimit;
+  stepper.moveTo(target);
 
-        int v = analogRead(SENSOR);
-        bool triggered = activeHigh ? (v > analogSensorThreshold)
-                                    : (v < analogSensorThreshold);
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
 
-        if (triggered) {
-            stepper.stop();              // decelerate cleanly
-            while (stepper.isRunning())  // wait for stop
-                stepper.run();
-            stepper.setCurrentPosition(0);
-            currPos = 0;
-            return false;
-        }
+    int v = analogRead(SENSOR);
+    bool triggered = activeHigh ? (v > analogSensorThreshold)
+                                : (v < analogSensorThreshold);
+
+    if (!triggered) {
+      break;  // we are now OFF the magnet
     }
+  }
 
-    Serial.println("Home Sensor not found");
-    return true;
+  // ----------------------------------------------------
+  // PHASE 2: Now search for the magnet normally
+  // ----------------------------------------------------
+  // Continue in the SAME direction
+  target = stepper.currentPosition() - safetyLimit;
+  stepper.moveTo(target);
+
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+
+    int v = analogRead(SENSOR);
+    bool triggered = activeHigh ? (v > analogSensorThreshold)
+                                : (v < analogSensorThreshold);
+
+    if (triggered) {
+      stepper.stop();
+      while (stepper.isRunning())
+        stepper.run();
+
+      stepper.setCurrentPosition(0);
+      currPos = 0;
+
+      if (DEBUG) Serial.println("Home found");
+      return false;
+    }
+  }
+
+  Serial.println("Home Sensor not found");
+  return true;
 }
 
-// bool homeWheel() {
-//   int v;
-//   long safetyLimit = stepsPerRevolution * 2;
-//   long stepsMoved = 0;
 
-//   if (DEBUG) Serial.println("=== HOMING START ===");
-
-//   // Back off
-//   stepper.runToNewPosition(stepper.currentPosition() - 1000);
-
-//   // Constant-speed homing
-//   stepper.setAcceleration(0);
-//   stepper.setMaxSpeed(200);
-//   stepper.setSpeed(100);
-
-//   while (stepsMoved < safetyLimit) {
-//     stepper.runSpeed();
-//     stepsMoved++;
-
-//     v = analogRead(SENSOR);
-//     delayMicroseconds(500);
-
-//     bool triggered = activeHigh ? (v > analogSensorThreshold)
-//                                 : (v < analogSensorThreshold);
-
-//     if (triggered) break;
-//   }
-
-//   // while (stepsMoved < safetyLimit) {
-//   //     stepper.runSpeed();
-//   //     stepsMoved++;
-
-//   //     v = analogRead(SENSOR);
-
-//   //     Serial.print(stepsMoved);
-//   //     Serial.print(",");
-//   //     Serial.println(v);
-
-//   //     bool triggered = activeHigh ? (v > analogSensorThreshold)
-//   //                                 : (v < analogSensorThreshold);
-
-//   //     if (triggered) {
-//   //         Serial.println("=== TRIGGER DETECTED ===");
-//   //         break;
-//   //     }
-//   // }
-
-//   if (stepsMoved >= safetyLimit) {
-//     Serial.println("Home Sensor not found");
-//     return true;
-//   }
-
-//   if (DEBUG) {
-//     Serial.print("=== HOMED at step ");
-//     Serial.print(stepsMoved);
-//     Serial.println(" ===");
-//   }
-
-//   stepper.setSpeed(0);
-//   stepper.setCurrentPosition(0);
-//   currPos = 0;
-
-//   return false;
-// }
 
 // =========================================================
 // MOVEMENT
@@ -286,10 +255,17 @@ bool homeWheel() {
 
 void goToLocation(int newPos) {
   if (newPos < 1 || newPos > numberOfFilters) return;
+  if (DEBUG) {
+    Serial.print("GoTo ");
+    Serial.print(newPos);
+    Serial.print(" filterPos[newPos] = ");
+    Serial.print(filterPos[newPos]);
+    Serial.print(" posOffset[newPos-1] = ");
+    Serial.println(posOffset[newPos - 1]);
+  }
 
   if (newPos < currPos) {
-    Error = homeWheel();
-    if (Error) return;
+    stepper.runToNewPosition(filterPos[newPos] + posOffset[newPos - 1] - backlashOvershoot);
   }
 
   stepper.runToNewPosition(filterPos[newPos] + posOffset[newPos - 1]);
@@ -318,72 +294,72 @@ void handleSerial(char firstChar, char secondChar) {
 
   switch (toupper(firstChar)) {
 
-  case 'B':
-    tmpPoss = currPos;
-    for (int i = 0; i < number; i++) {
-      tmpPoss--;
-      if (tmpPoss == 0) tmpPoss = numberOfFilters;
-    }
-    goToLocation(tmpPoss);
-    sendSerial("P" + String(currPos));
-    break;
-
-  case 'F':
-    tmpPoss = currPos;
-    for (int i = 0; i < number; i++) {
-      tmpPoss++;
-      if (tmpPoss == numberOfFilters + 1) tmpPoss = 1;
-    }
-    goToLocation(tmpPoss);
-    sendSerial("P" + String(currPos));
-    break;
-
-  case 'G':
-    goToLocation(number);
-    sendSerial("P" + String(currPos));
-    break;
-
-  case 'R':
-    switch (number) {
-    case 0:
-    case 1:
-      resetFunc();
+    case 'B':
+      tmpPoss = currPos;
+      for (int i = 0; i < number; i++) {
+        tmpPoss--;
+        if (tmpPoss == 0) tmpPoss = numberOfFilters;
+      }
+      goToLocation(tmpPoss);
+      sendSerial("P" + String(currPos));
       break;
 
-    case 2:
-      for (int i = 0; i < numberOfFilters; i++) posOffset[i] = 0;
-      for (int i = 0; i < numberOfFilters; i++) writeInt(50 + i * 2, posOffset[i]);
+    case 'F':
+      tmpPoss = currPos;
+      for (int i = 0; i < number; i++) {
+        tmpPoss++;
+        if (tmpPoss == numberOfFilters + 1) tmpPoss = 1;
+      }
+      goToLocation(tmpPoss);
+      sendSerial("P" + String(currPos));
+      break;
+
+    case 'G':
+      goToLocation(number);
+      sendSerial("P" + String(currPos));
+      break;
+
+    case 'R':
+      switch (number) {
+        case 0:
+        case 1:
+          resetFunc();
+          break;
+
+        case 2:
+          for (int i = 0; i < numberOfFilters; i++) posOffset[i] = 0;
+          for (int i = 0; i < numberOfFilters; i++) writeInt(50 + i * 2, posOffset[i]);
+          Error = homeWheel();
+          if (!Error) goToLocation(1);
+          sendSerial("Calibration Removed");
+          break;
+
+        case 6:
+          for (int i = 0; i < numberOfFilters; i++) writeInt(50 + i * 2, posOffset[i]);
+          break;
+      }
+      break;
+
+    case '(':
+      tmpPoss = currPos;
+      posOffset[tmpPoss - 1] += offSetResolution;
       Error = homeWheel();
-      if (!Error) goToLocation(1);
-      sendSerial("Calibration Removed");
+      if (!Error) goToLocation(tmpPoss);
+      writeInt(50 + (tmpPoss - 1) * 2, posOffset[tmpPoss - 1]);
+      sendSerial("P" + String(currPos) + " Offset " + String(posOffset[currPos - 1] / 5));
       break;
 
-    case 6:
-      for (int i = 0; i < numberOfFilters; i++) writeInt(50 + i * 2, posOffset[i]);
+    case ')':
+      tmpPoss = currPos;
+      posOffset[tmpPoss - 1] -= offSetResolution;
+      Error = homeWheel();
+      if (!Error) goToLocation(tmpPoss);
+      writeInt(50 + (tmpPoss - 1) * 2, posOffset[tmpPoss - 1]);
+      sendSerial("P" + String(currPos) + " Offset " + String(posOffset[currPos - 1] / 5));
       break;
-    }
-    break;
 
-  case '(':
-    tmpPoss = currPos;
-    posOffset[tmpPoss - 1] += offSetResolution;
-    Error = homeWheel();
-    if (!Error) goToLocation(tmpPoss);
-    writeInt(50 + (tmpPoss - 1) * 2, posOffset[tmpPoss - 1]);
-    sendSerial("P" + String(currPos) + " Offset " + String(posOffset[currPos - 1] / 5));
-    break;
-
-  case ')':
-    tmpPoss = currPos;
-    posOffset[tmpPoss - 1] -= offSetResolution;
-    Error = homeWheel();
-    if (!Error) goToLocation(tmpPoss);
-    writeInt(50 + (tmpPoss - 1) * 2, posOffset[tmpPoss - 1]);
-    sendSerial("P" + String(currPos) + " Offset " + String(posOffset[currPos - 1] / 5));
-    break;
-
-  default:
-    Serial.println("Command Unknown");
+    default:
+      Serial.println("Command Unknown");
   }
 }
 
@@ -423,8 +399,7 @@ void setup() {
 
   // Load or auto-detect sensor settings
   if (!loadSensorSettings()) detectSensorType();
-  // detectSensorType();
-  
+
 
   // Home and move to filter 1
   Error = homeWheel();
@@ -435,18 +410,75 @@ void setup() {
 // LOOP
 // =========================================================
 
+
+// --- Debounce state ---
+const unsigned long debounceTime = 50;  // 50ms is ideal for mechanical buttons
+
+unsigned long lastUpPress = 0;
+unsigned long lastDownPress = 0;
+
+bool lastUpState = HIGH;
+bool lastDownState = HIGH;
+
 void loop() {
-  if (digitalRead(upButton) == LOW && currPos < numberOfFilters) {
-    goToLocation(currPos + 1);
-    sendSerial("P" + String(currPos));
-    delay(150);
+
+  // ============================
+  // UP BUTTON (edge-triggered)
+  // ============================
+  bool upState = digitalRead(upButton);
+
+  // Detect falling edge (button pressed)
+  if (upState == LOW && lastUpState == HIGH) {
+    unsigned long now = millis();
+    if (now - lastUpPress > debounceTime) {
+
+      if (DEBUG) {
+        Serial.print("UP: currPos = ");
+        Serial.print(currPos);
+        Serial.print(" of ");
+        Serial.println(numberOfFilters);
+      }
+
+      if (currPos < numberOfFilters) {
+        goToLocation(currPos + 1);
+        sendSerial("P" + String(currPos));
+      }
+
+      lastUpPress = now;
+    }
   }
 
-  if (digitalRead(downButton) == LOW && currPos > 1) {
-    goToLocation(currPos - 1);
-    sendSerial("P" + String(currPos));
-    delay(150);
+  lastUpState = upState;
+
+
+
+  // ============================
+  // DOWN BUTTON (edge-triggered)
+  // ============================
+  bool downState = digitalRead(downButton);
+
+  if (downState == LOW && lastDownState == HIGH) {
+    unsigned long now = millis();
+    if (now - lastDownPress > debounceTime) {
+
+      if (DEBUG) {
+        Serial.print("DOWN: currPos = ");
+        Serial.print(currPos);
+        Serial.print(" of ");
+        Serial.println(numberOfFilters);
+      }
+
+      if (currPos > 1) {
+        goToLocation(currPos - 1);
+        sendSerial("P" + String(currPos));
+      }
+
+      lastDownPress = now;
+    }
   }
+
+  lastDownState = downState;
+
 
   if (Serial.available() > 0) {
     delay(10);
