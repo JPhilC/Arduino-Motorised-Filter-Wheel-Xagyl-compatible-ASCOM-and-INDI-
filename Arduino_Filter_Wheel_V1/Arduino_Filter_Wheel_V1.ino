@@ -1,0 +1,465 @@
+#include <AccelStepper.h>
+#include <EEPROM.h>
+
+// =========================================================
+// CONFIGURATION
+// =========================================================
+
+#define DEBUG 1   // Set to 1 for verbose debug output
+
+// Pins
+#define SENSOR A3
+#define hallPower A2
+#define hallCom A1
+#define upButton 5
+#define downButton 4
+#define buzzerPin 2
+#define ledPin 3
+
+// Motor pins (28BYJ-48 + ULN2003)
+#define IN1 9
+#define IN2 6
+#define IN3 8
+#define IN4 7
+
+// Motor settings
+#define maxSpeed 400
+#define Speed 400
+#define setAccel 1000
+#define stepsPerRevolution 2048
+
+// Filter wheel settings
+#define numberOfFilters 5
+#define offSetResolution 5
+#define homingOffsetSteps -73
+
+// Optional peripherals
+#define buzzerConnected 0
+#define ledConnected 0
+
+// Motor type (fixed)
+#define motorType 1   // 1 = unipolar 28BYJ-48
+
+// =========================================================
+// GLOBALS
+// =========================================================
+
+#if motorType == 1
+AccelStepper stepper(4, IN1, IN3, IN2, IN4);
+#endif
+
+int filterPos[numberOfFilters + 1];
+int posOffset[numberOfFilters];
+
+bool Error = false;
+int currPos = 0;
+
+// Sensor characteristics (EEPROM-backed)
+bool sensorIsDigital = false;
+bool activeHigh = true;
+int analogSensorThreshold = 650;
+
+// EEPROM addresses
+#define EE_THRESH 10
+#define EE_DIGITAL 12
+#define EE_ACTIVEHIGH 13
+
+// =========================================================
+// EEPROM HELPERS
+// =========================================================
+
+void writeInt(int addr, int value) {
+  EEPROM.write(addr, value >> 8);
+  EEPROM.write(addr + 1, value & 0xFF);
+}
+
+int readInt(int addr) {
+  return (EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
+}
+
+void saveSensorSettings() {
+  writeInt(EE_THRESH, analogSensorThreshold);
+  EEPROM.write(EE_DIGITAL, sensorIsDigital ? 1 : 0);
+  EEPROM.write(EE_ACTIVEHIGH, activeHigh ? 1 : 0);
+}
+
+bool loadSensorSettings() {
+  int t = readInt(EE_THRESH);
+  int d = EEPROM.read(EE_DIGITAL);
+  int a = EEPROM.read(EE_ACTIVEHIGH);
+
+  if (t < 100 || t > 900) return false;
+  if (d != 0 && d != 1) return false;
+  if (a != 0 && a != 1) return false;
+
+  analogSensorThreshold = t;
+  sensorIsDigital = d;
+  activeHigh = a;
+
+  if (DEBUG) {
+    Serial.println("Loaded sensor settings from EEPROM:");
+    Serial.print("Threshold="); Serial.println(analogSensorThreshold);
+    Serial.print("Digital="); Serial.println(sensorIsDigital);
+    Serial.print("ActiveHigh="); Serial.println(activeHigh);
+  }
+
+  return true;
+}
+
+// =========================================================
+// SENSOR AUTO-DETECT
+// =========================================================
+
+void detectSensorType() {
+  Serial.println("EEPROM invalid → running auto-detect…");
+
+  int v, minVal = 1023, maxVal = 0;
+
+  delay(50);
+
+  // Back off to clear magnet
+  stepper.runToNewPosition(stepper.currentPosition() - 1000);
+
+  // Sweep one full revolution
+  stepper.setAcceleration(setAccel);
+  stepper.setMaxSpeed(maxSpeed);
+  stepper.setSpeed(Speed);
+
+  long target = stepper.currentPosition() + stepsPerRevolution;
+  stepper.moveTo(target);
+
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+    v = analogRead(SENSOR);
+    if (v < minVal) minVal = v;
+    if (v > maxVal) maxVal = v;
+  }
+
+  Serial.print("min="); Serial.print(minVal);
+  Serial.print(" max="); Serial.println(maxVal);
+
+  // Digital detection
+  if (minVal < 50 || maxVal > 970) {
+    sensorIsDigital = true;
+    activeHigh = (maxVal > 970);
+    Serial.println("Sensor is DIGITAL");
+  } else {
+    sensorIsDigital = false;
+    activeHigh = (maxVal > minVal);
+
+    // *** UPDATED THRESHOLD MARGIN ***
+    analogSensorThreshold = activeHigh ? (maxVal - 40) : (minVal + 40);
+
+    Serial.println("Sensor is ANALOG");
+    Serial.print("Analog threshold = "); Serial.println(analogSensorThreshold);
+    Serial.print("Polarity: active "); Serial.println(activeHigh ? "HIGH" : "LOW");
+  }
+
+  // Rewind
+  stepper.runToNewPosition(stepper.currentPosition() - stepsPerRevolution);
+  stepper.setCurrentPosition(0);
+
+  saveSensorSettings();
+  Serial.println("Auto-detect complete. Values saved.");
+}
+
+// =========================================================
+// MOTOR + FEEDBACK HELPERS
+// =========================================================
+
+void motor_Off() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// =========================================================
+// HOMING
+// =========================================================
+
+bool homeWheel() {
+    long safetyLimit = stepsPerRevolution * 2;
+    long target = stepper.currentPosition() + safetyLimit;
+  
+  if (DEBUG) {
+    Serial.println("=== HOMING START ===");
+    Serial.print("safetyLimit = ");
+    Serial.println(safetyLimit);
+    Serial.print("target = ");
+    Serial.println(target);
+  }
+
+    stepper.setAcceleration(setAccel);
+    stepper.setMaxSpeed(maxSpeed);
+    stepper.moveTo(target);
+
+    while (stepper.distanceToGo() != 0) {
+        stepper.run();   // <-- identical timing to detectSensorType()
+
+        int v = analogRead(SENSOR);
+        bool triggered = activeHigh ? (v > analogSensorThreshold)
+                                    : (v < analogSensorThreshold);
+
+        if (triggered) {
+            stepper.stop();              // decelerate cleanly
+            while (stepper.isRunning())  // wait for stop
+                stepper.run();
+            stepper.setCurrentPosition(0);
+            currPos = 0;
+            return false;
+        }
+    }
+
+    Serial.println("Home Sensor not found");
+    return true;
+}
+
+// bool homeWheel() {
+//   int v;
+//   long safetyLimit = stepsPerRevolution * 2;
+//   long stepsMoved = 0;
+
+//   if (DEBUG) Serial.println("=== HOMING START ===");
+
+//   // Back off
+//   stepper.runToNewPosition(stepper.currentPosition() - 1000);
+
+//   // Constant-speed homing
+//   stepper.setAcceleration(0);
+//   stepper.setMaxSpeed(200);
+//   stepper.setSpeed(100);
+
+//   while (stepsMoved < safetyLimit) {
+//     stepper.runSpeed();
+//     stepsMoved++;
+
+//     v = analogRead(SENSOR);
+//     delayMicroseconds(500);
+
+//     bool triggered = activeHigh ? (v > analogSensorThreshold)
+//                                 : (v < analogSensorThreshold);
+
+//     if (triggered) break;
+//   }
+
+//   // while (stepsMoved < safetyLimit) {
+//   //     stepper.runSpeed();
+//   //     stepsMoved++;
+
+//   //     v = analogRead(SENSOR);
+
+//   //     Serial.print(stepsMoved);
+//   //     Serial.print(",");
+//   //     Serial.println(v);
+
+//   //     bool triggered = activeHigh ? (v > analogSensorThreshold)
+//   //                                 : (v < analogSensorThreshold);
+
+//   //     if (triggered) {
+//   //         Serial.println("=== TRIGGER DETECTED ===");
+//   //         break;
+//   //     }
+//   // }
+
+//   if (stepsMoved >= safetyLimit) {
+//     Serial.println("Home Sensor not found");
+//     return true;
+//   }
+
+//   if (DEBUG) {
+//     Serial.print("=== HOMED at step ");
+//     Serial.print(stepsMoved);
+//     Serial.println(" ===");
+//   }
+
+//   stepper.setSpeed(0);
+//   stepper.setCurrentPosition(0);
+//   currPos = 0;
+
+//   return false;
+// }
+
+// =========================================================
+// MOVEMENT
+// =========================================================
+
+void goToLocation(int newPos) {
+  if (newPos < 1 || newPos > numberOfFilters) return;
+
+  if (newPos < currPos) {
+    Error = homeWheel();
+    if (Error) return;
+  }
+
+  stepper.runToNewPosition(filterPos[newPos] + posOffset[newPos - 1]);
+  currPos = newPos;
+
+  motor_Off();
+}
+
+// =========================================================
+// SERIAL PROTOCOL (unchanged from original)
+// =========================================================
+
+void serialFlush() {
+  if (Serial.available()) Serial.read();
+}
+
+void sendSerial(String s) {
+  Serial.println(s);
+}
+
+void (*resetFunc)(void) = 0;
+
+void handleSerial(char firstChar, char secondChar) {
+  int number = int(secondChar - 48);
+  int tmpPoss;
+
+  switch (toupper(firstChar)) {
+
+  case 'B':
+    tmpPoss = currPos;
+    for (int i = 0; i < number; i++) {
+      tmpPoss--;
+      if (tmpPoss == 0) tmpPoss = numberOfFilters;
+    }
+    goToLocation(tmpPoss);
+    sendSerial("P" + String(currPos));
+    break;
+
+  case 'F':
+    tmpPoss = currPos;
+    for (int i = 0; i < number; i++) {
+      tmpPoss++;
+      if (tmpPoss == numberOfFilters + 1) tmpPoss = 1;
+    }
+    goToLocation(tmpPoss);
+    sendSerial("P" + String(currPos));
+    break;
+
+  case 'G':
+    goToLocation(number);
+    sendSerial("P" + String(currPos));
+    break;
+
+  case 'R':
+    switch (number) {
+    case 0:
+    case 1:
+      resetFunc();
+      break;
+
+    case 2:
+      for (int i = 0; i < numberOfFilters; i++) posOffset[i] = 0;
+      for (int i = 0; i < numberOfFilters; i++) writeInt(50 + i * 2, posOffset[i]);
+      Error = homeWheel();
+      if (!Error) goToLocation(1);
+      sendSerial("Calibration Removed");
+      break;
+
+    case 6:
+      for (int i = 0; i < numberOfFilters; i++) writeInt(50 + i * 2, posOffset[i]);
+      break;
+    }
+    break;
+
+  case '(':
+    tmpPoss = currPos;
+    posOffset[tmpPoss - 1] += offSetResolution;
+    Error = homeWheel();
+    if (!Error) goToLocation(tmpPoss);
+    writeInt(50 + (tmpPoss - 1) * 2, posOffset[tmpPoss - 1]);
+    sendSerial("P" + String(currPos) + " Offset " + String(posOffset[currPos - 1] / 5));
+    break;
+
+  case ')':
+    tmpPoss = currPos;
+    posOffset[tmpPoss - 1] -= offSetResolution;
+    Error = homeWheel();
+    if (!Error) goToLocation(tmpPoss);
+    writeInt(50 + (tmpPoss - 1) * 2, posOffset[tmpPoss - 1]);
+    sendSerial("P" + String(currPos) + " Offset " + String(posOffset[currPos - 1] / 5));
+    break;
+
+  default:
+    Serial.println("Command Unknown");
+  }
+}
+
+// =========================================================
+// SETUP
+// =========================================================
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(hallCom, OUTPUT);
+  pinMode(hallPower, OUTPUT);
+  pinMode(SENSOR, INPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(upButton, INPUT_PULLUP);
+  pinMode(downButton, INPUT_PULLUP);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+
+  digitalWrite(hallCom, LOW);
+  digitalWrite(hallPower, HIGH);
+
+  stepper.setCurrentPosition(0);
+  stepper.setMaxSpeed(maxSpeed);
+  stepper.setSpeed(Speed);
+  stepper.setAcceleration(setAccel);
+
+  // Compute filter positions
+  filterPos[0] = 0;
+  for (int i = 0; i < numberOfFilters; i++) {
+    filterPos[i + 1] = (i * (stepsPerRevolution / numberOfFilters)) + homingOffsetSteps;
+    posOffset[i] = readInt(50 + i * 2);
+  }
+
+  // Load or auto-detect sensor settings
+  if (!loadSensorSettings()) detectSensorType();
+  // detectSensorType();
+  
+
+  // Home and move to filter 1
+  Error = homeWheel();
+  if (!Error) goToLocation(1);
+}
+
+// =========================================================
+// LOOP
+// =========================================================
+
+void loop() {
+  if (digitalRead(upButton) == LOW && currPos < numberOfFilters) {
+    goToLocation(currPos + 1);
+    sendSerial("P" + String(currPos));
+    delay(150);
+  }
+
+  if (digitalRead(downButton) == LOW && currPos > 1) {
+    goToLocation(currPos - 1);
+    sendSerial("P" + String(currPos));
+    delay(150);
+  }
+
+  if (Serial.available() > 0) {
+    delay(10);
+    if (Serial.available() >= 2) {
+      char one = Serial.read();
+      char two = Serial.read();
+      if (!isDigit(one) && isDigit(two)) handleSerial(one, two);
+      else serialFlush();
+    } else serialFlush();
+  }
+
+  if (Error) {
+    Serial.println("Homing Failed");
+    Error = false;
+  }
+}
